@@ -3,6 +3,9 @@ import psycopg2.extras
 from psycopg2.extensions import ISOLATION_LEVEL_AUTOCOMMIT
 import logging
 from typing import Optional
+import logging
+from typing import Optional
+from skills_hierarchy_definitions import skill_hierarchy 
 
 
 DB_HOST = 'localhost'
@@ -284,7 +287,57 @@ class PostgresSkillsPipeline:
             self.logger.error(f"Error: {e}")
             return 0
 
+def populate_skill_relationships(db_pipeline, hierarchy_dict: dict):
+    """
+    Populates the 'skillrelationship' table based on a hierarchy dictionary.
+    
+    This function assumes the 'skill' table is already populated.
 
+    Args:
+        db_pipeline: An instance of PostgresSkillsPipeline with an active connection.
+        hierarchy_dict (dict): A dictionary defining the parent-child skill relationships.
+    """
+    logger = logging.getLogger(__name__)
+    cursor = db_pipeline.get_cursor()
+
+    if not cursor:
+        logger.error("Failed to get a database cursor. Exiting.")
+        return
+
+    # Step 1: Get the IDs for all skills to build relationships
+    logger.info("Fetching skill IDs from the 'skill' table...")
+    cursor.execute("SELECT id, name FROM skill")
+    skill_name_to_id = {row['name']: row['id'] for row in cursor.fetchall()}
+
+    # Step 2: Insert relationships into the 'skillrelationship' table
+    logger.info("Inserting skill relationships...")
+    for parent_name, children_names in hierarchy_dict.items():
+        parent_id = skill_name_to_id.get(parent_name)
+        if not parent_id:
+            logger.warning(f"Parent skill '{parent_name}' not found in database. Skipping relationships.")
+            continue
+
+        for child_name in children_names:
+            child_id = skill_name_to_id.get(child_name)
+            if not child_id:
+                logger.warning(f"Child skill '{child_name}' not found in database. Skipping relationship.")
+                continue
+            
+            # Check for existing relationship to prevent duplicates
+            cursor.execute(
+                "SELECT id FROM skillrelationship WHERE parentid = %s AND childid = %s",
+                (parent_id, child_id)
+            )
+            if cursor.fetchone() is None:
+                cursor.execute(
+                    "INSERT INTO skillrelationship (parentid, childid) VALUES (%s, %s)",
+                    (parent_id, child_id)
+                )
+                logger.info(f"Inserted relationship: Parent '{parent_name}' -> Child '{child_name}'")
+            else:
+                logger.info(f"Relationship already exists for '{parent_name}' -> '{child_name}'. Skipping.")
+    
+    logger.info("Skill relationships population complete.")
 def setup_database():
     """Setup complete database with tables"""
     try:
@@ -307,6 +360,9 @@ if __name__ == "__main__":
         print("Database setup completed!")
         processed_count = db_pipeline.process_jobs_file("jobs.json")
         print(f"Processed {processed_count} jobs")
+        
+        populate_skill_relationships(db_pipeline, skill_hierarchy)
+        
         db_pipeline.close()
     else:
         print("Database setup failed")
