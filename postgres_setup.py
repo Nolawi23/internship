@@ -32,17 +32,18 @@ class PostgresSkillsPipeline:
             self.logger.error(f"Failed to connect to PostgreSQL: {e}")
             self.conn = None
             raise
+        # Create tables
         try:
-            if self.create_tables():
-                print("Database setup completed successfully!")
-                return None
+            if not self.create_tables():
+                self.logger.error("Failed to create tables")
+                raise Exception("Table creation failed")  # ✅ Raise exception instead
             else:
-                print("Failed to create tables")
-                self.close()
-                return None
+                self.logger.info("Database setup completed successfully!")
         except Exception as e:
-            print(f"Failed to setup database: {e}")
-            return None
+            self.logger.error(f"Failed to setup database: {e}")
+            if self.conn:
+                self.conn.close()  
+            raise
     
     def create_tables(self):
         """Create all required tables according to schema"""
@@ -141,8 +142,8 @@ class PostgresSkillsPipeline:
                     grouptype evidence_type,
                     name VARCHAR(255),
                     description VARCHAR(255),
-                    skillids INTEGER,
-                    weight INTEGER,
+                    skillids INTEGER[],
+                    skillweight JSONB,
                     metadata JSONB,
                     scoretosfiathreshold JSONB
                 )
@@ -154,7 +155,7 @@ class PostgresSkillsPipeline:
                     id SERIAL PRIMARY KEY,
                     parentid INTEGER,
                     childid INTEGER,
-                    weight INTEGER,
+                    weight FLOAT,
                     metadata JSONB
                 )
             """)
@@ -193,6 +194,16 @@ class PostgresSkillsPipeline:
                     skillgroup INTEGER
                 )
             """)
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS frequency (
+                    skill_id INTEGER PRIMARY KEY REFERENCES skill(id) ON DELETE CASCADE,  -- ✅ Direct primary key
+                    name VARCHAR(255) NOT NULL,                                          -- ✅ Skill name included
+                    direct_frequency INTEGER DEFAULT 0,
+                    total_frequency INTEGER DEFAULT 0,
+                    job_count INTEGER DEFAULT 0,
+                    last_updated TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
             
             # Create indexes for performance
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_trainee_email ON trainee(email)")
@@ -205,7 +216,11 @@ class PostgresSkillsPipeline:
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_skillrel_child ON skillrelationship(childid)")
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_evidence_traineid ON evidence(traineid)")
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_evidence_skillgroup ON evidence(skillgroup)")
-            
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_frequency_name ON frequency(name)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_frequency_total_freq ON frequency(total_frequency)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_frequency_direct_freq ON frequency(direct_frequency)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_frequency_job_count ON frequency(job_count)")
+
             self.logger.info("All tables created successfully")
             return True
             
@@ -221,6 +236,8 @@ class PostgresSkillsPipeline:
     
     def get_cursor(self):
         """Get database cursor"""
-        if self.conn:
+        if self.conn and not self.conn.closed:  # ✅ Check if connection is alive
             return self.conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-        return None
+        else:
+            self.logger.error("Database connection is not available or closed")
+            return None
