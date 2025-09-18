@@ -36,7 +36,7 @@ class PostgresSkillsPipeline:
         try:
             if not self.create_tables():
                 self.logger.error("Failed to create tables")
-                raise Exception("Table creation failed")  # ✅ Raise exception instead
+                raise Exception("Table creation failed")
             else:
                 self.logger.info("Database setup completed successfully!")
         except Exception as e:
@@ -123,13 +123,13 @@ class PostgresSkillsPipeline:
                 )
             """)
             
-            # 7. Competency table
+            # 7. Updated Competency table with new structure
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS competency (
                     id SERIAL PRIMARY KEY,
                     name VARCHAR(255),
-                    skillgroup INTEGER,
-                    skillweight JSONB,
+                    skillgroup INTEGER[],
+                    skillgroupweight JSONB,
                     metadata JSONB,
                     evidence INTEGER
                 )
@@ -194,10 +194,12 @@ class PostgresSkillsPipeline:
                     skillgroup INTEGER
                 )
             """)
+            
+            # 13. Frequency table
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS frequency (
-                    skill_id INTEGER PRIMARY KEY REFERENCES skill(id) ON DELETE CASCADE,  -- ✅ Direct primary key
-                    name VARCHAR(255) NOT NULL,                                          -- ✅ Skill name included
+                    skill_id INTEGER PRIMARY KEY REFERENCES skill(id) ON DELETE CASCADE,
+                    name VARCHAR(255) NOT NULL,
                     direct_frequency INTEGER DEFAULT 0,
                     total_frequency INTEGER DEFAULT 0,
                     job_count INTEGER DEFAULT 0,
@@ -205,22 +207,31 @@ class PostgresSkillsPipeline:
                 )
             """)
             
-            # Create indexes for performance
-            cursor.execute("CREATE INDEX IF NOT EXISTS idx_trainee_email ON trainee(email)")
-            cursor.execute("CREATE INDEX IF NOT EXISTS idx_assignment_traineid ON assignment(traineid)")
-            cursor.execute("CREATE INDEX IF NOT EXISTS idx_assignment_category ON assignment(assignmentcategory)")
-            cursor.execute("CREATE INDEX IF NOT EXISTS idx_skill_name ON skill(name)")
-            cursor.execute("CREATE INDEX IF NOT EXISTS idx_skillgroup_name ON skillgroup(name)")
-            cursor.execute("CREATE INDEX IF NOT EXISTS idx_competency_name ON competency(name)")
-            cursor.execute("CREATE INDEX IF NOT EXISTS idx_skillrel_parent ON skillrelationship(parentid)")
-            cursor.execute("CREATE INDEX IF NOT EXISTS idx_skillrel_child ON skillrelationship(childid)")
-            cursor.execute("CREATE INDEX IF NOT EXISTS idx_evidence_traineid ON evidence(traineid)")
-            cursor.execute("CREATE INDEX IF NOT EXISTS idx_evidence_skillgroup ON evidence(skillgroup)")
-            cursor.execute("CREATE INDEX IF NOT EXISTS idx_frequency_name ON frequency(name)")
-            cursor.execute("CREATE INDEX IF NOT EXISTS idx_frequency_total_freq ON frequency(total_frequency)")
-            cursor.execute("CREATE INDEX IF NOT EXISTS idx_frequency_direct_freq ON frequency(direct_frequency)")
-            cursor.execute("CREATE INDEX IF NOT EXISTS idx_frequency_job_count ON frequency(job_count)")
-
+                        # Create indexes for performance
+            index_statements = [
+                ("idx_trainee_email", "trainee", "email"),
+                ("idx_assignment_traineid", "assignment", "traineid"),
+                ("idx_assignment_category", "assignment", "assignmentcategory"),
+                ("idx_skill_name", "skill", "name"),
+                ("idx_skillgroup_name", "skillgroup", "name"),
+                ("idx_competency_name", "competency", "name"),
+                ("idx_competency_skillgroup", "competency", "skillgroup"),
+                ("idx_skillrel_parent", "skillrelationship", "parentid"),
+                ("idx_skillrel_child", "skillrelationship", "childid"),
+                ("idx_evidence_traineid", "evidence", "traineid"),
+                ("idx_evidence_skillgroup", "evidence", "skillgroup"),
+                ("idx_frequency_name", "frequency", "name"),
+                ("idx_frequency_total_freq", "frequency", "total_frequency"),
+                ("idx_frequency_direct_freq", "frequency", "direct_frequency"),
+                ("idx_frequency_job_count", "frequency", "job_count"),
+            ]
+            
+            for idx_name, table, column in index_statements:
+                cursor.execute(
+                    f"CREATE INDEX IF NOT EXISTS {idx_name} ON {table}({column})"
+                )
+                
+                
             self.logger.info("All tables created successfully")
             return True
             
@@ -236,7 +247,7 @@ class PostgresSkillsPipeline:
     
     def get_cursor(self):
         """Get database cursor"""
-        if self.conn and not self.conn.closed:  # ✅ Check if connection is alive
+        if self.conn and not self.conn.closed:
             return self.conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
         else:
             self.logger.error("Database connection is not available or closed")

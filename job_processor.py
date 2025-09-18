@@ -1,11 +1,13 @@
 import json
 import logging
+from collections import defaultdict
 from postgres_setup import PostgresSkillsPipeline
 from skills_hierarchy_definitions import skill_hierarchy
 
 class JobProcessor:
     def __init__(self):
         self.db_postgres = PostgresSkillsPipeline()
+        self.competency_to_skillgroups = defaultdict(list)  # Track competency -> skillgroup mappings
         
     def extract_skills_from_job(self, job_data):
         """Extract all skills from job competencies"""
@@ -108,6 +110,11 @@ class JobProcessor:
             None
         ))
         skillgroup_id = cursor.fetchone()['id']
+        
+        # Track competencies for this skillgroup
+        for comp_name in competency_data.keys():
+            self.competency_to_skillgroups[comp_name].append(skillgroup_id)
+        
         self.db_postgres.conn.commit()
         self.db_postgres.logger.info(f"Created skillgroup {skillgroup_id} for job {job_id}")
         return skillgroup_id
@@ -182,12 +189,13 @@ class JobProcessor:
                 skillgroup_id = self.create_skillgroup_with_skills(skills_list, skill_ids, job_id, competency_data)
             else:
                 skillgroup_id = existing_job['skillgroup']
+                # Still need to track competencies for existing skillgroups
+                for comp_name in competency_data.keys():
+                    if skillgroup_id not in self.competency_to_skillgroups[comp_name]:
+                        self.competency_to_skillgroups[comp_name].append(skillgroup_id)
                 self.db_postgres.logger.info(f"Job {job_id} already has skillgroup {skillgroup_id}")
             
-            # Step 4: Populate the competency table
-            self.insert_competencies(job_data, competency_data, skill_name_to_id_accumulator)
-            
-            # Step 5: Insert or update job
+            # Step 4: Insert or update job
             if existing_job:
                 # Update existing job with skillgroup if it was missing
                 if existing_job['skillgroup'] is None:
@@ -212,70 +220,75 @@ class JobProcessor:
             self.db_postgres.logger.error(f"Error processing job {job_id}: {e}")
             return False
         
-    def insert_competencies(self, job_data, competency_data, skill_name_to_id_accumulator: dict):
+    def insert_competencies(self):
         """
-        Extracts and inserts competencies into the competency table, using
-        weights from the skills hierarchy.
-        
-        Args:
-            job_data (dict): The job data containing competency information.
-            competency_data (dict): The dictionary of competency data to be processed.
-            skill_name_to_id_accumulator (dict): Accumulator for skill name to ID mapping.
+        Process all competencies after all jobs are loaded to populate skillgroup arrays and weights.
+        This should be called AFTER all jobs have been processed.
         """
         cursor = self.db_postgres.get_cursor()
         if not cursor:
             self.db_postgres.logger.error("Failed to get a database cursor.")
             return False
 
-        competency_id_mapping = {}
-
+        self.db_postgres.logger.info("Finalizing competencies with skillgroup mappings...")
+        
         try:
-            for comp_name, details in competency_data.items():
-                # Extract skill names from the details
-                comp_skills_list = [item['name'] for item in details.get('skills', [])]
-                if not comp_skills_list:
-                    self.db_postgres.logger.warning(f"Competency '{comp_name}' has no skills, skipping.")
-                    continue
+            updated_count = 0
+            
+            for comp_name, skillgroup_ids in self.competency_to_skillgroups.items():
+                # Remove duplicates and sort for consistency
+                unique_skillgroup_ids = sorted(list(set(skillgroup_ids)))
                 
-                # Create a JSON object to store the SFIA level for this competency
-                competency_sfia_level = {"SFIA level": details.get('sfia_level', None)}
+                # Calculate weights if competency appears in multiple skillgroups
+                skillgroup_weights = {}
+                if len(unique_skillgroup_ids) > 1:
+                    # For now, assign equal weights. This could be enhanced later with more sophisticated logic
+                    base_weight = 1.0 / len(unique_skillgroup_ids)
+                    for sg_id in unique_skillgroup_ids:
+                        skillgroup_weights[str(sg_id)] = round(base_weight, 3)
+                # If only one skillgroup, leave weights empty as requested
                 
-                # Step 1: Check if competency already exists
+                # Check if competency already exists
                 cursor.execute("SELECT id FROM competency WHERE name = %s", (comp_name,))
                 existing_comp = cursor.fetchone()
 
-                if not existing_comp:
-                    # Insert the new competency
+                if existing_comp:
+                    # Update existing competency
+                    cursor.execute("""
+                        UPDATE competency 
+                        SET skillgroup = %s, skillgroupweight = %s 
+                        WHERE name = %s
+                    """, (
+                        unique_skillgroup_ids,
+                        json.dumps(skillgroup_weights) if skillgroup_weights else None,
+                        comp_name
+                    ))
+                    self.db_postgres.logger.info(f"Updated competency '{comp_name}' with {len(unique_skillgroup_ids)} skillgroups")
+                else:
+                    # Insert new competency with proper skillgroup data
                     cursor.execute("""
                         INSERT INTO competency (
                             name,
-                            skillweight,
-                            metadata,
+                            skillgroup,
+                            skillgroupweight,
                             evidence
-                        ) VALUES (%s, %s, %s, %s) RETURNING id
+                        ) VALUES (%s, %s, %s, %s)
                     """, (
                         comp_name,
-                        json.dumps(competency_sfia_level),
-                        json.dumps({
-                            "source_job_id": job_data.get('id'),
-                            "summary": details.get('summary'),
-                            "relevance": details.get('relevance')
-                        }),
+                        unique_skillgroup_ids,
+                        json.dumps(skillgroup_weights) if skillgroup_weights else None,
                         None
                     ))
-                    comp_id = cursor.fetchone()['id']
-                    competency_id_mapping[comp_name] = comp_id
-                    self.db_postgres.logger.info(f"Inserted new competency '{comp_name}' with ID {comp_id}")
-                else:
-                    comp_id = existing_comp['id']
-                    competency_id_mapping[comp_name] = comp_id
-                    self.db_postgres.logger.info(f"Competency '{comp_name}' already exists.")
+                    self.db_postgres.logger.info(f"Created competency '{comp_name}' with {len(unique_skillgroup_ids)} skillgroups")
+                
+                updated_count += 1
             
             self.db_postgres.conn.commit()
-            return competency_id_mapping
+            self.db_postgres.logger.info(f"Finalized {updated_count} competencies with skillgroup mappings")
+            return True
             
         except Exception as e:
-            self.db_postgres.logger.error(f"Error processing competencies for job {job_data.get('id')}: {e}")
+            self.db_postgres.logger.error(f"Error finalizing competencies: {e}")
             self.db_postgres.conn.rollback()
             return False    
 
@@ -539,6 +552,9 @@ class JobProcessor:
             # Accumulate all skills and their IDs as we process jobs
             all_skills_to_ids = {}
             
+            # Clear competency tracking at start
+            self.competency_to_skillgroups.clear()
+            
             self.db_postgres.logger.info(f"Starting to process {total_jobs} jobs")
             
             # Process all jobs and collect skills simultaneously
@@ -556,6 +572,13 @@ class JobProcessor:
             self.db_postgres.logger.info(
                 f"Completed job processing: {processed_count} successful, {failed_count} failed out of {total_jobs} total"
             )
+            
+            # Finalize competencies with skillgroup mappings
+            self.db_postgres.logger.info("Finalizing competencies...")
+            if self.insert_competencies():
+                self.db_postgres.logger.info("Competencies finalized successfully!")
+            else:
+                self.db_postgres.logger.error("Failed to finalize competencies")
             
             # Now populate ALL skill relationships from hierarchy + job skills
             self.db_postgres.logger.info(f"Populating COMPLETE skill relationships...")
@@ -686,6 +709,54 @@ class JobProcessor:
         
         return relationships
 
+    def get_competency_analysis(self):
+        """Get analysis of competency-skillgroup mappings"""
+        cursor = self.db_postgres.get_cursor()
+        
+        cursor.execute("""
+            SELECT 
+                name,
+                skillgroup,
+                skillgroupweight,
+                array_length(skillgroup, 1) as skillgroup_count,
+                metadata
+            FROM competency
+            ORDER BY array_length(skillgroup, 1) DESC, name
+        """)
+        
+        competencies = cursor.fetchall()
+        
+        self.db_postgres.logger.info(f"\n=== COMPETENCY ANALYSIS ===")
+        self.db_postgres.logger.info(f"Total competencies: {len(competencies)}")
+        
+        # Group by skillgroup count
+        single_skillgroup = []
+        multiple_skillgroups = []
+        
+        for comp in competencies:
+            if comp['skillgroup_count'] == 1:
+                single_skillgroup.append(comp)
+            elif comp['skillgroup_count'] > 1:
+                multiple_skillgroups.append(comp)
+        
+        self.db_postgres.logger.info(f"Competencies in single skillgroup: {len(single_skillgroup)}")
+        self.db_postgres.logger.info(f"Competencies in multiple skillgroups: {len(multiple_skillgroups)}")
+        
+        if multiple_skillgroups:
+            self.db_postgres.logger.info(f"\nCompetencies with multiple skillgroups (showing first 10):")
+            for comp in multiple_skillgroups[:10]:
+                weights_info = "with weights" if comp['skillgroupweight'] else "no weights"
+                self.db_postgres.logger.info(f"  {comp['name']}: {comp['skillgroup_count']} skillgroups ({weights_info})")
+                if comp['skillgroupweight']:
+                    weights = json.loads(comp['skillgroupweight'])
+                    self.db_postgres.logger.info(f"    Weights: {weights}")
+        
+        return {
+            'total': len(competencies),
+            'single_skillgroup': len(single_skillgroup),
+            'multiple_skillgroups': len(multiple_skillgroups)
+        }
+
     def get_processing_summary(self):
         """Get summary of processed data"""
         cursor = self.db_postgres.get_cursor()
@@ -703,11 +774,15 @@ class JobProcessor:
         cursor.execute("SELECT COUNT(*) as count FROM skillrelationship")
         relationship_count = cursor.fetchone()['count']
         
+        cursor.execute("SELECT COUNT(*) as count FROM competency")
+        competency_count = cursor.fetchone()['count']
+        
         return {
             'jobs': job_count,
             'skills': skill_count,
             'skillgroups': skillgroup_count,
-            'skill_relationships': relationship_count
+            'skill_relationships': relationship_count,
+            'competencies': competency_count
         }
 
     def close_connection(self):
@@ -717,15 +792,22 @@ class JobProcessor:
     def clear_and_restart(self):
         """Clear all job-related data and restart fresh"""
         cursor = self.db_postgres.get_cursor()
-        
+    
+        # List all tables to clear (add any new tables here)
+        tables_to_clear = [
+            'frequency',
+            'competency',
+            'job',
+            'skillgroup',
+            'skillrelationship',
+            'skill',
+            # Add more tables here if needed
+        ]
+    
         # Clear tables in reverse dependency order
-        cursor.execute("DELETE FROM frequency")
-        cursor.execute("DELETE FROM competency")
-        cursor.execute("DELETE FROM job")
-        cursor.execute("DELETE FROM skillgroup") 
-        cursor.execute("DELETE FROM skillrelationship")
-        cursor.execute("DELETE FROM skill")
-        
+        for table in tables_to_clear:
+            cursor.execute(f"DELETE FROM {table}")
+    
         # Reset sequences to start from 1 (check if they exist first)
         sequences_to_reset = [
             'skill_id_seq',
@@ -733,19 +815,18 @@ class JobProcessor:
             'skillrelationship_id_seq',
             'competency_id_seq'
         ]
-        
+    
         for sequence in sequences_to_reset:
             try:
                 cursor.execute(f"ALTER SEQUENCE {sequence} RESTART WITH 1")
                 self.db_postgres.logger.debug(f"Reset sequence: {sequence}")
             except Exception as e:
-                # Sequence might not exist, just log and continue
                 self.db_postgres.logger.debug(f"Could not reset sequence {sequence}: {e}")
-        
-        # Note: frequency table uses skill_id as primary key, no sequence to restart
-
+    
+        # Clear competency tracking
+        self.competency_to_skillgroups.clear()
+    
         self.db_postgres.logger.info("Cleared all job, competency, skillgroup, skill, frequency, and relationship data and reset ID sequences")
-
 if __name__ == "__main__":
     processor = JobProcessor()
     processor.clear_and_restart()  # Uncomment to reset all data and IDs
@@ -765,6 +846,14 @@ if __name__ == "__main__":
     print(f"  - Skills: {summary['skills']}")
     print(f"  - Skill Groups: {summary['skillgroups']}")
     print(f"  - Skill Relationships: {summary['skill_relationships']}")
+    print(f"  - Competencies: {summary['competencies']}")
+    
+    # Show competency analysis
+    if summary['competencies'] > 0:
+        print(f"\n" + "="*50)
+        print("COMPETENCY ANALYSIS")
+        print("="*50)
+        processor.get_competency_analysis()
     
     # Show weight analysis
     if summary['skill_relationships'] > 0:
